@@ -1,0 +1,9 @@
+selenium
+open3d==0.18.0
+opencv-python
+numpy<2.0
+pillow
+pyrr
+texture2ddecoder
+tqdm
+scipy
