@@ -4,6 +4,8 @@
 
 ### 安装
 ```
+conda create -n mapscraper python=3.9
+conda activate mapscraper
 git clone https://github.com/Jeremyfff/MapScraper.git
 cd MapScraper
 pip install -r requirements.txt
