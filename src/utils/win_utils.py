@@ -6,19 +6,25 @@
 import ctypes
 import logging
 import time
+from typing import Union
 
 import win32con
 import win32gui
 
 
-def find_window_with_title(window_tile, max_retry_count=5) -> int:
+def find_window_with_title(window_tile: Union[str, list[str]], max_retry_count=5) -> int:
+    if isinstance(window_tile, str):
+        window_tile = [window_tile]
     hwnd = 0
     for i in range(max_retry_count):
-        hwnd = win32gui.FindWindow(None, window_tile)
-        if hwnd == 0:
-            logging.warning(f"第{i + 1}/{max_retry_count}次尝试，未找到目标窗口: {window_tile}")
-        if hwnd != 0:
+        fount = False
+        for wt in window_tile:
+            hwnd = win32gui.FindWindow(None, wt)
+            if hwnd != 0:
+                fount = True
+        if fount:
             break
+        logging.warning(f"第{i + 1}/{max_retry_count}次尝试，未找到目标窗口: {window_tile}")
         time.sleep(1)
 
     if hwnd == 0:
@@ -28,6 +34,7 @@ def find_window_with_title(window_tile, max_retry_count=5) -> int:
 
 def get_chrome_gpu_pid(hwnd) -> int:
     texts = []
+
     def enum_child(hwnd_child, _):
         class_name = win32gui.GetClassName(hwnd_child)
         if class_name == 'Static':
@@ -47,6 +54,7 @@ def get_chrome_gpu_pid(hwnd) -> int:
                     texts.append(clean_text)
 
         return True
+
     win32gui.EnumChildWindows(hwnd, enum_child, None)
     if not texts:
         raise Exception("未找到文本内容")

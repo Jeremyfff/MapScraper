@@ -103,7 +103,7 @@ if __name__ == "__main__":
         config = None
     driver = su.open_driver()
     time.sleep(1)
-    popup_hwnd = wu.find_window_with_title(window_tile="Google Chrome Gpu")
+    popup_hwnd = wu.find_window_with_title(window_tile=["Google Chrome Gpu", "Chromium Gpu"])
     pid = wu.get_chrome_gpu_pid(popup_hwnd)
     inject_into_process(pid)
     time.sleep(0.2)
