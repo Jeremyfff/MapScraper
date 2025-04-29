@@ -19,6 +19,6 @@ pip install -r requirements.txt
 仅供学习renderdoc技术使用，严禁商用
 
 ### 成果截图
-![img_2.png](assets/img_2.png)
-![img_1.png](assets/img_1.png)
-![img.png](assets/img.png)
+![img_2.png](assets/img_2.jpg)
+![img_1.png](assets/img_1.jpg)
+![img.png](assets/img.jpg)
