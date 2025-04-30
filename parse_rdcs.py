@@ -1,19 +1,19 @@
-# -*- coding: utf-8 -*-
-# @Author  : Yiheng Feng
-# @Time    : 4/28/2025 7:52 PM
-# @Function:
 import logging
 import os
-import threading
-import time
-from collections import deque, defaultdict
+from collections import defaultdict
 from enum import IntFlag, auto
 
 import numpy as np
 import open3d as o3d
-from tqdm import tqdm
 from scipy.spatial import KDTree
-from parse_rdc import extract_data_from_rdc, BatchData, DrawData, create_open3d_meshes, create_open3d_mesh, create_coordinate_axis
+from tqdm import tqdm
+
+from parse_rdc import extract_data_from_rdc__google_earth
+from src.dataclasses import BatchData, DrawData
+from src.o3d_utils import create_open3d_meshes, create_coordinate_axis
+
+logger = logging.getLogger(__file__)
+logger.setLevel(logging.DEBUG)
 
 
 class BatchHelperFlags(IntFlag):
@@ -27,72 +27,15 @@ class BatchHelper:
     def __init__(self, debug_geometries: list = None, flags: BatchHelperFlags = BatchHelperFlags.NONE):
         self.flags = flags
         self.batches: list[BatchData] = []
-        self.batch_centers: list[np.ndarray] = []  # (nBatches, (nDraws, 3))
-        self.batch_features: list[np.ndarray] = []  # (nBatches, (nDraws, 3))
-        self.batch_transforms: list[np.ndarray] = []  # (nBatches, (3, ))
-        self.batch_successes: list[bool] = []  # (nBatches, bool)
         self.debug_geometries = debug_geometries if debug_geometries is not None else []
 
     def get_success_batches(self) -> list[BatchData]:
-        return [batch for batch, success in zip(self.batches, self.batch_successes) if success]
-
-    @staticmethod
-    def extract_draw_feature(draw: DrawData, texture: bool = True, uv: bool = True) -> np.ndarray:
-        """提取形状特征，可选添加纹理和UV特征
-
-        Args:
-            draw: 包含顶点、纹理和UV数据的DrawData对象
-            texture: 是否包含纹理特征（默认True）
-            uv: 是否包含UV坐标特征（默认True）
-
-        Returns:
-            np.ndarray: 组合后的特征向量
-        """
-        # --------------------- 1. 形状特征 ---------------------
-        centroid = np.mean(draw.vertices, axis=0)
-        centered = draw.vertices - centroid
-        cov_matrix = np.cov(centered, rowvar=False)
-        eigenvalues = np.linalg.eigvalsh(cov_matrix)
-        eigenvalues.sort()
-        shape_feature = eigenvalues[::-1]  # (3,)
-
-        # --------------------- 2. 可选特征 ---------------------
-        feature_parts = [shape_feature]
-
-        # 纹理特征（RGB均值）
-        if texture and hasattr(draw, 'texture') and draw.texture is not None:
-            texture_mean = np.mean(draw.texture[..., :3], axis=(0, 1))  # (3,)
-            feature_parts.append(texture_mean)
-
-        # UV坐标均值
-        if uv and hasattr(draw, 'uvs') and draw.uvs is not None:
-            uv_mean = np.mean(draw.uvs, axis=0)  # (2,)
-            feature_parts.append(uv_mean)
-
-        # --------------------- 3. 拼接特征 ---------------------
-        combined_feature = np.concatenate(feature_parts)
-        return combined_feature
-
-    @staticmethod
-    def extract_batch_features(batch: BatchData) -> np.ndarray:
-        features = []
-        for draw in batch.draw_datas.values():
-            feature = BatchHelper.extract_draw_feature(draw)
-            features.append(feature)
-        return np.array(features)  # (nDraws, features)
-
-    @staticmethod
-    def extract_batch_centers(batch: BatchData) -> np.ndarray:
-        centers = []
-        for draw in batch.draw_datas.values():
-            centroid = np.mean(draw.vertices, axis=0)
-            centers.append(centroid)
-        return np.array(centers)
+        return [batch for batch in self.batches if batch.success]
 
     def addBatch(self, batch: BatchData):
         """add a batch and align to other batches"""
         if batch in self.batches:
-            logging.error(f"Batch {batch} already exists")
+            logger.error(f"Batch {batch} already exists")
             return
 
         # self._preprocess_batch(batch)
@@ -111,10 +54,7 @@ class BatchHelper:
 
         # 遍历所有 draw 数据并计算包围盒
         for key, draw in draws.items():
-            mesh = create_open3d_mesh(draw.vertices, draw.triangles, None, None)
-            aabb = mesh.get_axis_aligned_bounding_box()
-
-            # 计算最大尺寸
+            aabb = draw.get_aabb()
             size = aabb.get_max_bound() - aabb.get_min_bound()
             max_size = max(size)
 
@@ -127,16 +67,13 @@ class BatchHelper:
 
         # 计算中位数和阈值
         median_size = np.median(max_sizes)
-        threshold = 1.5 * median_size
+        threshold = 1.66 * median_size
 
-        # 收集需要删除的键
         to_remove = [key for key, size in zip(keys, max_sizes) if size > threshold]
-
-        # 从原始数据中删除异常项
         for key in to_remove:
             draws.pop(key)
 
-        # 标记颜色（已删除的项仍会显示为红色）
+        # 标记颜色（已删除的项会显示为红色）
         for aabb, size in zip(aabbs, max_sizes):
             aabb.color = (1, 0, 0) if size > threshold else (0, 1, 0)
 
@@ -149,32 +86,27 @@ class BatchHelper:
         # print(f"剩余有效项数量: {len(draws)}")
         # print(f"中位数尺寸: {median_size:.2f}, 阈值: {threshold:.2f}")
 
-    def _align_batch_in_adding_stage(self, batch: BatchData, feature_vector_threshold=0.05, max_top_k=10) -> bool:
-        features: np.ndarray = self.extract_batch_features(batch)
-        centers: np.ndarray = self.extract_batch_centers(batch)
-        avg_translation = np.zeros((3,), dtype=np.float32)
-        assert len(features) == len(centers)
-        if len(self.batch_features) == 0:
-            self.batch_features.append(features)
-            self.batch_centers.append(centers)
-            self.batch_transforms.append(avg_translation)
-            self.batch_successes.append(True)
-            return True
-        prev_cursor = len(self.batches)
-        success = False
+    def _align_batch_in_adding_stage(self, batch: BatchData, feature_vector_threshold=0.05, max_top_k=10):
+        # precalculate features and centers in case we delete draw.vertices in the post process
+        _ = batch.features
+        _ = batch.centers
+        if len(self.batches) == 0:  # if no other batches in the list
+            batch.success = True  # mark as success and return
+            return
 
-        while prev_cursor > 0:  # 从后往前搜索
-            prev_cursor -= 1
-            prev_features: np.ndarray = self.batch_features[prev_cursor]
-            prev_centers: np.ndarray = self.batch_centers[prev_cursor]
+        prev_batch_cursor = len(self.batches)
+        success = False
+        while prev_batch_cursor > 0:  # 从后往前搜索
+            prev_batch_cursor -= 1
+            prev_batch = self.batches[prev_batch_cursor]
 
             # --------------------- 1. 计算欧氏距离矩阵 ---------------------
             dist_matrix = np.sqrt(
-                np.sum((features[:, np.newaxis] - prev_features[np.newaxis, :]) ** 2, axis=2)
+                np.sum((batch.features[:, np.newaxis] - prev_batch.features[np.newaxis, :]) ** 2, axis=2)
             )
             # --------------------- 2. 建立初步匹配关系 ---------------------
             candidate_matches = []
-            for i in range(len(features)):
+            for i in range(len(batch.features)):
                 best_match_idx = np.argmin(dist_matrix[i])
                 min_distance = dist_matrix[i, best_match_idx]
                 if min_distance < feature_vector_threshold:
@@ -184,7 +116,7 @@ class BatchHelper:
             # 按距离从小到大排序
             sorted_matches = sorted(candidate_matches, key=lambda x: x[2])
 
-            # 取前10个匹配（如果总匹配数不足则取全部）
+            # 取前max_top_k个匹配（如果总匹配数不足则取全部）
             max_matches = min(max_top_k, len(sorted_matches))
             best_matches = sorted_matches[:max_matches]
             # 提取匹配信息和距离
@@ -195,16 +127,14 @@ class BatchHelper:
             if len(matches) == 0:
                 continue
 
-            print([f"从{len(candidate_matches)}个match中筛选出前{len(best_matches)}个结果 -> {match}:{dist:.4f}" for match, dist in zip(matches, distances)])
+            logger.debug([f"从{len(candidate_matches)}个match中筛选出前{len(best_matches)}个结果 -> {match}:{dist:.4f}" for match, dist in zip(matches, distances)])
 
             # 收集匹配项的中心点偏移
-            # prev_drawcallIds = list(prev_batch.draw_datas.keys())
-            # curr_drawcallIds = list(batch.draw_datas.keys())
             translation_vectors = []
 
             for curr_idx, prev_idx in matches:
-                curr_centroid = centers[curr_idx]
-                prev_centroid = prev_centers[prev_idx]
+                curr_centroid = batch.centers[curr_idx]
+                prev_centroid = prev_batch.centers[prev_idx]
                 translation_vectors.append(prev_centroid - curr_centroid)
 
             # --------------------- 5. 加权平移（使用前10个匹配的距离权重） ---------------------
@@ -213,19 +143,12 @@ class BatchHelper:
             avg_translation = np.dot(weights, translation_vectors)
 
             # --------------------- 6. 应用平移 ---------------------
-            for draw in batch.draw_datas.values():
-                draw.vertices += avg_translation
-            centers += avg_translation  # 同时移动centers
-            # features与位置无关，不动
+            batch.translate(avg_translation)
             success = True
             break
         if not success:
-            logging.warning(f"Align failed after {len(self.batch_features)} attempts.batch file name: {batch.file_name}")
-        self.batch_features.append(features)
-        self.batch_centers.append(centers)
-        self.batch_transforms.append(avg_translation)
-        self.batch_successes.append(success)
-        return success
+            logger.warning(f"Align failed after {len(self.batches)} attempts.batch file name: {batch.file_name}")
+        batch.success = success
 
     def _post_process_batch_in_adding_stage(self, batch: BatchData):
         if self.flags & BatchHelperFlags.DISCARD_UVS:
@@ -262,18 +185,8 @@ class BatchHelper:
         """
 
         # --------------------- 阶段1: 过滤失败批次 ---------------------
-        # 创建成功批次的索引列表
-        success_indices = [i for i, success in enumerate(self.batch_successes) if success]
-        original_batch_count = len(self.batches)
+        self.batches = [batch for batch in self.batches if batch.success]
 
-        # 更新所有数据为仅包含成功批次
-        self.batches = [self.batches[i] for i in success_indices]
-        self.batch_centers = [self.batch_centers[i] for i in success_indices]
-        self.batch_features = [self.batch_features[i] for i in success_indices]
-        self.batch_transforms = [self.batch_transforms[i] for i in success_indices]
-        self.batch_successes = [self.batch_successes[i] for i in success_indices]
-        if debug_print:
-            logging.info(f"✅ 批次过滤: 原始批次 {original_batch_count} -> 成功批次 {len(self.batches)}")
         # --------------------- 阶段2: 展平所有draw数据 ---------------------
         all_draws = []  # 存储所有draw数据
         all_centers = []  # 存储所有中心点坐标
@@ -283,11 +196,9 @@ class BatchHelper:
         # 遍历所有成功批次
         for batch_idx in range(len(self.batches)):
             batch = self.batches[batch_idx]
-            centers = self.batch_centers[batch_idx]
-            features = self.batch_features[batch_idx]
+            centers = batch.centers
+            features = batch.features
             total_draws_before += len(batch.draw_datas)
-            # 验证数据一致性
-            assert len(batch.draw_datas) == len(centers) == len(features)
 
             # 展平数据并建立映射
             for draw_idx, (drawcallId, draw_data) in enumerate(batch.draw_datas.items()):
@@ -297,7 +208,7 @@ class BatchHelper:
                 all_features.append(features[draw_idx])
                 draw_id_map[flat_idx] = (batch_idx, drawcallId)
 
-        # 转换为numpy数组以提升性能
+        # 转换为numpy数组
         all_centers = np.array(all_centers)  # (nTotalDraws, 3)
         all_features = np.array(all_features)  # (nTotalDraws, nFeatures)
 
@@ -360,7 +271,6 @@ class BatchHelper:
             batch_delete_map[batch_idx].add(drawcallId)
 
         # --------------------- 阶段7: 执行批量删除操作 ---------------------
-
         for batch_idx in range(len(self.batches)):
             # 获取当前batch数据
             batch = self.batches[batch_idx]
@@ -373,90 +283,54 @@ class BatchHelper:
             if debug_bbox:
                 for drawcallId in delete_ids:
                     draw = batch.draw_datas[drawcallId]  # 获取将被删除的draw数据
-
-                    # 生成调试几何体
-                    if draw.vertices is not None and draw.triangles is not None:
-                        mesh = create_open3d_mesh(draw.vertices, draw.triangles, None, None)
-                        aabb = mesh.get_axis_aligned_bounding_box()
+                    aabb = draw.get_aabb()
+                    if aabb is None:
+                        continue
+                    aabb.color = (1, 0, 0)
+                    self.debug_geometries.append(aabb)
+            # ===================== 调试代码结束 =====================
+            for drawcallId in delete_ids:
+                draw_to_delete = batch.draw_datas.pop(drawcallId)
+                if debug_bbox:
+                    aabb = draw_to_delete.get_aabb()
+                    if aabb is not None:
                         aabb.color = (1, 0, 0)
                         self.debug_geometries.append(aabb)
-            # ===================== 调试代码结束 =====================
+            # recalculate centers and features
+            _ = batch.centers
+            _ = batch.features
 
-            # 删除指定draws
-            new_draws = {
-                drawcallId: draw_data
-                for drawcallId, draw_data in batch.draw_datas.items()
-                if drawcallId not in delete_ids
-            }
-
-            # 更新batch数据
-            batch.draw_datas = new_draws
-
-            # 更新缓存数据
-            keep_indices = [
-                idx for idx, drawCallId in enumerate(batch.draw_datas.keys())
-                if drawCallId not in delete_ids
-            ]
-            self.batch_centers[batch_idx] = self.batch_centers[batch_idx][keep_indices]
-            self.batch_features[batch_idx] = self.batch_features[batch_idx][keep_indices]
         # 打印汇总信息
         if debug_print:
             total_draws_after = sum(len(batch.draw_datas) for batch in self.batches)
-            logging.info("📊 ")
-            logging.info(f"📊处理结果汇总:原始Draw总数({total_draws_before}) -> 最终Draw总数({total_draws_after})")
+            logger.info(f"📊处理结果汇总:原始Draw总数({total_draws_before}) -> 最终Draw总数({total_draws_after})")
 
 
 def extract_data_from_multiple_rdc(file_paths: list[str], debug_geometries: list = None,
                                    flags: BatchHelperFlags = BatchHelperFlags.NONE) -> list[BatchData]:
     assert len(file_paths) > 0, "No file paths provided"
     helper = BatchHelper(debug_geometries, flags)
+    for i, file_path in enumerate(file_paths):
+        logger.info(f"[{i + 1}/{len(file_paths)}] Batch {file_path} start ------------------------------------")
+        try:
+            batch = extract_data_from_rdc__google_earth(file_path, show_progress=False, print_duration=False)
+        except Exception as e:
+            logger.error(f"Extract_data_from_rdc failed: {file_path}, reason: {str(e)}")
+            continue
 
-    batches_queue: deque[BatchData] = deque()
-    _read_complete = False
-
-    ref_matrix = None
-    def rdc_reader():
-        nonlocal _read_complete
-        for file_path in file_paths:
-            while len(batches_queue) > 3:
-                time.sleep(0.1)
-            try:
-                batches_queue.append(extract_data_from_rdc(file_path, show_progress=False, print_duration=False))
-            except Exception as e:
-                logging.error(f"Extract_data_from_rdc failed: {file_path}, reason: {str(e)}")
-                continue
-        _read_complete = True
-
-    def rdc_parser():
-        while True:
-            if len(batches_queue) == 0 and _read_complete:
-                break
-            while len(batches_queue) == 0:
-                time.sleep(0.1)
-            batch = batches_queue.popleft()
-            try:
-                helper.addBatch(batch)
-            except Exception as e:
-                logging.error(f"Add batch failed: {batch.file_name}, reason: {str(e)}")
-                continue
-            logging.info(f"=====================Batch {batch.file_name} processed=========================")
-
-    rdc_reader_thread = threading.Thread(target=rdc_reader)
-    rdc_parser_thread = threading.Thread(target=rdc_parser)
-
-    rdc_reader_thread.start()
-    rdc_parser_thread.start()
-
-    rdc_reader_thread.join()
-    rdc_parser_thread.join()
+        try:
+            helper.addBatch(batch)
+        except Exception as e:
+            logger.error(f"Add batch failed: {batch.file_name}, reason: {str(e)}")
+            continue
+        logger.info(f"[{i + 1}/{len(file_paths)}] Batch {file_path} processed ------------------------------------")
 
     helper.post_process_batches(debug_bbox=False, debug_print=True)
     return helper.get_success_batches()
 
 
 if __name__ == "__main__":
-
-    folder_path = "./results/2025-04-29_22-31-12/rdc"  # 2025-04-27_19-18-14
+    folder_path = "./results/2025-04-30_20-42-40/rdc"  # 2025-04-27_19-18-14
     file_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path)]
     file_paths.sort(key=lambda x: os.path.getctime(x))  # 按创建日期排序
 
@@ -469,6 +343,6 @@ if __name__ == "__main__":
     for batch_data in tqdm(batch_datas, desc="Creating Open3D Meshes"):
         map_geometries.extend(create_open3d_meshes(batch_data))
 
-    logging.info("Starting Open3D")
+    logger.info("Starting Open3D")
     all_geometries = debug_geometries + map_geometries
     o3d.visualization.draw_geometries(all_geometries)

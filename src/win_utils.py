@@ -22,6 +22,7 @@ def find_window_with_title(window_tile: Union[str, list[str]], max_retry_count=5
             hwnd = win32gui.FindWindow(None, wt)
             if hwnd != 0:
                 fount = True
+                break
         if fount:
             break
         logging.warning(f"第{i + 1}/{max_retry_count}次尝试，未找到目标窗口: {window_tile}")
